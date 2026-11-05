@@ -1,0 +1,33 @@
+name: Cross-platform desktop
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  build-and-package:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: pyproject.toml
+      - name: Install application and build tools
+        run: python -m pip install -e ".[build]"
+      - name: Verify Python source syntax
+        run: python -m compileall -q src/nupstudio
+      - name: Build standalone desktop application
+        run: python -m PyInstaller --clean --noconfirm --distpath build/dist --workpath build nupstudio.spec
+      - name: Upload standalone application
+        uses: actions/upload-artifact@v4
+        with:
+          name: NupStudio-${{ matrix.os }}
+          path: build/dist/NupStudio*
+          if-no-files-found: error
+          retention-days: 14

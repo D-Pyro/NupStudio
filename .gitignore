@@ -1,0 +1,9 @@
+build*/
+*.nupstudio.tmp
+.venv/
+dist/
+__pycache__/
+*.egg-info/
+*.spec
+!nupstudio.spec
+*.o
