@@ -9,7 +9,13 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [windows-latest, ubuntu-latest, macos-latest]
+        include:
+          - os: windows-latest
+            platform: windows
+          - os: ubuntu-latest
+            platform: linux
+          - os: macos-latest
+            platform: macos
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v7
@@ -24,6 +30,10 @@ jobs:
         run: python -m compileall -q src/nupstudio
       - name: Build standalone desktop application
         run: python -m PyInstaller --clean --noconfirm --distpath build/dist --workpath build nupstudio.spec
+      - name: Package release asset
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          python -c "from pathlib import Path; from zipfile import ZipFile, ZIP_DEFLATED; output = Path('build/dist'); binary = output / ('NupStudio.exe' if '${{ matrix.platform }}' == 'windows' else 'NupStudio'); archive = output / 'NupStudio-${{ matrix.platform }}.zip'; ZipFile(archive, 'w', ZIP_DEFLATED).write(binary, binary.name)"
       - name: Upload standalone application
         uses: actions/upload-artifact@v7
         with:
@@ -31,3 +41,31 @@ jobs:
           path: build/dist/NupStudio*
           if-no-files-found: error
           retention-days: 14
+      - name: Upload release package
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: actions/upload-artifact@v7
+        with:
+          name: release-${{ matrix.platform }}
+          path: build/dist/NupStudio-${{ matrix.platform }}.zip
+          if-no-files-found: error
+          retention-days: 1
+
+  create-release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: build-and-package
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download release packages
+        uses: actions/download-artifact@v7
+        with:
+          pattern: release-*
+          path: release-assets
+          merge-multiple: true
+      - name: Publish GitHub release
+        uses: softprops/action-gh-release@v3
+        with:
+          files: release-assets/*.zip
+          generate_release_notes: true
+          prerelease: ${{ contains(github.ref_name, '-') }}
