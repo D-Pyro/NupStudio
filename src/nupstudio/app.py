@@ -197,6 +197,9 @@ class MainWindow(QMainWindow):
         self.pack_compression.addItem("Off (raw)", 0)
         for level in (1, 3, 5, 10, 19):
             self.pack_compression.addItem(f"Zstandard {level}", level)
+        self.pack_compression.setToolTip(
+            "Files 256 MiB or larger are stored raw; NUP v1 does not support chunked Zstandard."
+        )
         self._field(form, "Title ID (hex)", self.pack_title_id)
         self._field(form, "Title", self.pack_title)
         self._field(form, "Publisher", self.pack_publisher)

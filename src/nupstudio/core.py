@@ -15,6 +15,7 @@ HEADER_SIZE = 128
 PACKAGE_SIZE = 64
 DIRECTORY_SIZE = 24
 FILE_SIZE = 80
+MAX_ZSTD_FILE_SIZE = 256 * 1024 * 1024
 TLV_NAMES = {3: "icon", 4: "version", 5: "title", 6: "publisher"}
 Progress = Callable[[int, str], None]
 
@@ -270,8 +271,10 @@ def _find_packages(
     ))
     if not found:
         raise NupError("No package folders containing exefs/ or romfs/ were found.")
-    if sum(_classify_package(path)[0] == 0 for path in found) > 1:
-        raise NupError("A NUP container can contain at most one base package.")
+    base_packages = [path for path in found if _classify_package(path)[0] == 0]
+    if len(base_packages) > 1:
+        base_paths = "\n  • ".join(p.relative_to(source).as_posix() for p in base_packages)
+        raise NupError(f"A NUP container can contain at most one base package, but found {len(base_packages)}:\n  • {base_paths}")
     return found
 
 
@@ -469,13 +472,16 @@ def _prepare_entries(packages: list[Package], compression_level: int,
         duplicate_key = None
         if entry.source is None:
             raise NupError("A package file has no source path.")
+        compress_entry = compressor is not None and entry.size < MAX_ZSTD_FILE_SIZE
         with entry.source.open("rb") as source:
             stage_path = temp_dir / f"extent-{len(seen)}.zst"
-            staged = stage_path.open("wb") if compressor else None
+            staged = stage_path.open("wb") if compress_entry else None
             try:
-                writer = None
-                if compressor and staged:
-                    writer = compressor.stream_writer(staged, closefd=False)
+                writer = (
+                    compressor.stream_writer(staged, size=entry.size, closefd=False)
+                    if compress_entry and staged
+                    else None
+                )
                 digest = hashlib.sha256()
                 size = 0
                 while True:
@@ -490,6 +496,8 @@ def _prepare_entries(packages: list[Package], compression_level: int,
                               "Preparing package files")
                 if writer:
                     writer.close()
+                if compress_entry and size != entry.size:
+                    raise NupError(f"Source file changed while preparing: {entry.rel}")
             finally:
                 if staged:
                     staged.close()
@@ -502,24 +510,23 @@ def _prepare_entries(packages: list[Package], compression_level: int,
             entry.stored = duplicate.stored
             entry.offset = duplicate.offset
             entry.staged = duplicate.staged
-            if compressor:
+            if compress_entry:
                 stage_path.unlink(missing_ok=True)
         else:
-            compressed_size = stage_path.stat().st_size if compressor and entry.size else entry.size
-            if compressor and compressed_size < entry.size:
+            compressed_size = stage_path.stat().st_size if compress_entry and entry.size else entry.size
+            if compress_entry and compressed_size < entry.size:
                 entry.codec = 1
                 entry.stored = compressed_size
                 entry.staged = stage_path
             else:
                 entry.codec = 0
                 entry.stored = entry.size
-                if compressor:
+                if compress_entry:
                     stage_path.unlink(missing_ok=True)
             if entry.size:
                 seen[duplicate_key] = entry
         complete += max(entry.size, 1)
-        _progress(progress, min(5, complete * 5 // max(total, 1)),
-                  "Prepared package files")
+    _progress(progress, 5, "Prepared package files")
 
 
 def _build_toc(packages: list[Package]) -> bytes:
