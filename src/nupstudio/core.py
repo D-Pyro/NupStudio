@@ -448,6 +448,8 @@ def inspect_folder(source: str | Path) -> dict[str, str]:
         "title": "",
         "publisher": "",
         "display_version": "",
+        "package_count": str(len(roots)),
+        "package_kinds": ",".join(str(_classify_package(candidate)[0]) for candidate in roots),
         "base_version": str(version) if kind == 0 else "",
         "update_version": (
             str(max(update_versions)) if update_versions

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import sys
 import struct
+import tempfile
 from typing import Callable
 
 from PySide6.QtCore import QThread, Qt, Signal, Slot
@@ -33,6 +34,7 @@ from .core import (
     inspect_nup,
     pack_folder,
 )
+from .lookup import LookupPanel
 
 
 class OperationWorker(QThread):
@@ -125,11 +127,14 @@ class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("NupStudio")
-        self.resize(760, 560)
+        self.resize(760, 660)
         self.setMinimumSize(620, 440)
         self.worker: OperationWorker | None = None
         self._embedded_icon = b""
         self._pack_inspect_workers: set[FolderInspectionWorker] = set()
+        self._lookup_temp = tempfile.TemporaryDirectory(prefix="nupstudio-ns2db-")
+        self._pack_lookup_fields = {"title", "publisher", "display_version"}
+        self._pack_lookup_icon = ""
 
         self.tabs = QTabWidget()
         self.pack_page, self.edit_page, self.extract_page = (
@@ -209,6 +214,15 @@ class MainWindow(QMainWindow):
         self._field(form, "Icon (optional)", self.pack_icon)
         self._field(form, "Compression", self.pack_compression)
         layout.addLayout(form)
+        self.pack_lookup = LookupPanel(
+            self._current_pack_values, lambda: self._pack_lookup_fields,
+            self._apply_lookup_pack_values,
+            lambda: ("These details can affect more than one package in the selected folder.\n"
+                     "Version changes depend on the packages being packed."),
+            self._lookup_temp.name, self,
+        )
+        self.pack_source.edit.textChanged.connect(self._invalidate_pack_lookup)
+        layout.addWidget(self.pack_lookup)
         layout.addWidget(self.pack_icon_preview, 0, Qt.AlignmentFlag.AlignHCenter)
         self.pack_action = QPushButton("Create NUP")
         self.pack_action.clicked.connect(self._start_pack)
@@ -259,6 +273,14 @@ class MainWindow(QMainWindow):
         self._field(form, "Display version", self.edit_display_version)
         self._field(form, "Replace icon (blank keeps current)", edit_icon_row)
         layout.addLayout(form)
+        self.edit_lookup = LookupPanel(
+            self._current_edit_values, self._allowed_edit_lookup_fields,
+            self._apply_lookup_edit_values,
+            lambda: "These details will only affect the selected package.",
+            self._lookup_temp.name, self,
+        )
+        self.edit_source.edit.textChanged.connect(self._invalidate_edit_lookup)
+        layout.addWidget(self.edit_lookup)
         self.edit_summary = QLabel("Select a NUP file to view package and compression details.")
         self.edit_summary.setWordWrap(True)
         layout.addWidget(self.edit_summary)
@@ -412,6 +434,13 @@ class MainWindow(QMainWindow):
         self._choose_folder(self.pack_source.edit, "Select a package folder or dump root")
         self._load_pack_fields()
 
+    def _invalidate_pack_lookup(self, _text: str) -> None:
+        self.pack_lookup.reset()
+        self._pack_lookup_fields = {"title", "publisher", "display_version"}
+
+    def _invalidate_edit_lookup(self, _text: str) -> None:
+        self.edit_lookup.reset()
+
     def _load_pack_fields(self) -> None:
         source = self.pack_source.edit.text().strip()
         if not source or source == self._last_pack_source:
@@ -430,6 +459,9 @@ class MainWindow(QMainWindow):
             if widget.text() == previous:
                 widget.clear()
         self._autofilled_pack_fields.clear()
+        if self._pack_lookup_icon and self.pack_icon.edit.text() == self._pack_lookup_icon:
+            self.pack_icon.edit.clear()
+        self._pack_lookup_icon = ""
         self.statusBar().showMessage("Scanning folder for package metadata…")
         worker = FolderInspectionWorker(source)
         self._pack_inspect_workers.add(worker)
@@ -455,6 +487,15 @@ class MainWindow(QMainWindow):
             if value and not widget.text():
                 widget.setText(value)
                 self._autofilled_pack_fields[key] = value
+        kinds = detected.get("package_kinds", "").split(",")
+        self._pack_lookup_fields = {"title", "publisher", "display_version"}
+        if any(kind in ("0", "1") for kind in kinds):
+            self._pack_lookup_fields.add("title_id")
+        if "0" in kinds:
+            self._pack_lookup_fields.add("base_version")
+        if detected.get("package_count") == "1" and kinds[0] in ("1", "2"):
+            self._pack_lookup_fields.add("update_version")
+        self.pack_lookup.reset(self.pack_title_id.text().strip())
         if not any(detected.get(key) for key in ("title", "publisher", "display_version")):
             self.statusBar().showMessage(
                 "No control.nacp metadata found; enter title, publisher, and display version manually."
@@ -468,6 +509,7 @@ class MainWindow(QMainWindow):
             self.statusBar().showMessage(f"Could not detect package metadata: {message}")
 
     def _load_edit_fields(self) -> None:
+        self.edit_lookup.reset()
         self._embedded_icon = b""
         self._edit_packages = []
         self._edit_package_drafts.clear()
@@ -530,7 +572,54 @@ class MainWindow(QMainWindow):
             "icon_path": self.edit_icon.edit.text(),
         }
 
+    def _current_pack_values(self) -> dict[str, str]:
+        return {
+            "title_id": self.pack_title_id.text(),
+            "title": self.pack_title.text(),
+            "publisher": self.pack_publisher.text(),
+            "base_version": self.pack_base_version.text(),
+            "update_version": self.pack_update_version.text(),
+            "display_version": self.pack_display_version.text(),
+            "icon_path": self.pack_icon.edit.text(),
+        }
+
+    def _apply_lookup_pack_values(self, values: dict[str, str]) -> None:
+        widgets = {
+            "title_id": self.pack_title_id, "title": self.pack_title,
+            "publisher": self.pack_publisher, "base_version": self.pack_base_version,
+            "update_version": self.pack_update_version,
+            "display_version": self.pack_display_version, "icon_path": self.pack_icon.edit,
+        }
+        for key, value in values.items():
+            widgets[key].setText(value)
+            if key == "icon_path":
+                self._pack_lookup_icon = value
+            else:
+                self._autofilled_pack_fields[key] = value
+
+    def _allowed_edit_lookup_fields(self) -> set[str]:
+        fields = {"title", "publisher", "display_version"}
+        index = self._active_edit_package
+        if index is None or not 0 <= index < len(self._edit_packages):
+            return set()
+        kind = self._edit_packages[index]["kind"]
+        if kind != 2:
+            fields.add("title_id")
+        fields.add("base_version" if kind == 0 else "update_version")
+        return fields
+
+    def _apply_lookup_edit_values(self, values: dict[str, str]) -> None:
+        widgets = {
+            "title_id": self.edit_title_id, "title": self.edit_title,
+            "publisher": self.edit_publisher, "base_version": self.edit_base_version,
+            "update_version": self.edit_update_version,
+            "display_version": self.edit_display_version, "icon_path": self.edit_icon.edit,
+        }
+        for key, value in values.items():
+            widgets[key].setText(value)
+
     def _load_selected_edit_package(self, index: int) -> None:
+        self.edit_lookup.reset()
         if self._active_edit_package is not None:
             self._edit_package_drafts[self._active_edit_package] = self._current_edit_values()
         if not 0 <= index < len(self._edit_packages):
@@ -556,6 +645,7 @@ class MainWindow(QMainWindow):
         )
         self.edit_icon.edit.setText(values.get("icon_path", ""))
         self._preview_edit_icon(self.edit_icon.edit.text())
+        self.edit_lookup.reset(self.edit_title_id.text().strip())
 
     def _start_pack(self) -> None:
         self._run(self.pack_action, pack_folder, {
@@ -626,12 +716,17 @@ class MainWindow(QMainWindow):
     def closeEvent(self, event) -> None:
         operation_running = self.worker is not None and self.worker.isRunning()
         inspection_running = any(worker.isRunning() for worker in self._pack_inspect_workers)
-        if operation_running or inspection_running:
+        lookup_running = any(
+            worker.isRunning() for panel in (self.pack_lookup, self.edit_lookup)
+            for worker in panel.workers
+        )
+        if operation_running or inspection_running or lookup_running:
             event.ignore()
             self.statusBar().showMessage(
                 "A background task is still running. Wait for it to finish before closing."
             )
             return
+        self._lookup_temp.cleanup()
         super().closeEvent(event)
 
 

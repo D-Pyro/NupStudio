@@ -28,6 +28,10 @@ jobs:
         run: python -m pip install -e ".[build]"
       - name: Verify Python source syntax
         run: python -m compileall -q src/nupstudio
+      - name: Run tests
+        env:
+          QT_QPA_PLATFORM: offscreen
+        run: python -m unittest discover -s tests -v
       - name: Build standalone desktop application
         run: python -m PyInstaller --clean --noconfirm --distpath build/dist --workpath build nupstudio.spec
       - name: Package release asset
