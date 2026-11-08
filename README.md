@@ -53,6 +53,7 @@ The executable or app bundle is written to `build/dist/`. The build omits unused
 - A container supports at most one base package. Update-only containers are marked standalone.
 - Zstandard compression levels can be selected when packing. Files 256 MiB or larger are stored raw because NUP v1 has no chunked Zstandard codec. Metadata edits preserve existing file extents.
 - Blank text fields clear their metadata. Leave the icon path blank to preserve the existing icon.
+- Wait for active background tasks to finish before closing the app.
 - The reader accepts zero alignment padding around the TOC string pool, metadata after file extents, and optional package-root names, while validating metadata bounds and overlaps.
 
 References: [NUP format specification](https://github.com/a55uka/nup/blob/meow/SPEC.md) · [NUPPacker folder-layout reference](https://github.com/PastaLaPate/NUPPacker)

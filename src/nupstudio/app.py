@@ -616,9 +616,23 @@ class MainWindow(QMainWindow):
             QMessageBox.critical(self, "NUP operation failed", error)
         else:
             self.statusBar().showMessage("Operation complete")
-            if self.tabs.currentIndex() == 1:
+            if button is self.edit_action and self.worker:
+                arguments = self.worker.arguments
+                saved_path = arguments.get("output") or arguments["path"]
+                self.edit_source.edit.setText(saved_path)
                 self._load_edit_fields()
             QMessageBox.information(self, "NupStudio", "Operation completed successfully.")
+
+    def closeEvent(self, event) -> None:
+        operation_running = self.worker is not None and self.worker.isRunning()
+        inspection_running = any(worker.isRunning() for worker in self._pack_inspect_workers)
+        if operation_running or inspection_running:
+            event.ignore()
+            self.statusBar().showMessage(
+                "A background task is still running. Wait for it to finish before closing."
+            )
+            return
+        super().closeEvent(event)
 
 
 def main() -> int:

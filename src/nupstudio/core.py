@@ -1128,7 +1128,13 @@ def extract_nup(path: str | Path, output: str | Path,
                             reader = _LimitedReader(archive, entry.stored)
                             try:
                                 with zstandard.ZstdDecompressor().stream_reader(reader) as decoded:
-                                    while chunk := decoded.read(1024 * 1024):
+                                    while chunk := decoded.read(
+                                        min(1024 * 1024, entry.size - written + 1)
+                                    ):
+                                        if written + len(chunk) > entry.size:
+                                            raise NupError(
+                                                f"Decompressed file exceeds its declared size: {entry.rel}"
+                                            )
                                         extracted.write(chunk)
                                         digest.update(chunk)
                                         written += len(chunk)
