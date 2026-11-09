@@ -663,7 +663,7 @@ def _write_container(
         metadata_pos = _align(metadata_pos, 8)
     blob_offset = _align(metadata_pos, 16)
     file_pos = blob_offset
-    extents: dict[tuple[int, bytes, int], int] = {}
+    extents: dict[tuple[int, bytes, int, int], int] = {}
     for package in packages:
         for entry in package.entries:
             if entry.is_dir:
@@ -671,12 +671,9 @@ def _write_container(
             if not entry.size:
                 entry.offset = 0
                 continue
-            key = (entry.size, entry.digest, entry.stored)
-            if source_archive is None and key in extents:
+            key = (entry.size, entry.digest, entry.stored, entry.codec)
+            if key in extents:
                 entry.offset = extents[key]
-            elif source_archive is not None:
-                entry.offset = _align(file_pos, 16)
-                file_pos = entry.offset + entry.stored
             else:
                 entry.offset = _align(file_pos, 16)
                 file_pos = entry.offset + entry.stored
@@ -706,7 +703,7 @@ def _write_container(
             total_work = sum(max(e.size, 1) for p in packages for e in p.entries
                              if not e.is_dir)
             completed_work = 0
-            written_extents: set[tuple[int, bytes, int]] = set()
+            written_extents: set[tuple[int, bytes, int, int]] = set()
             input_archive = source_archive.open("rb") if source_archive else None
             try:
                 for package in packages:
@@ -719,8 +716,8 @@ def _write_container(
                             _progress(progress, 5 + completed_work * 95 // max(total_work, 1),
                                       "Writing NUP container")
                             continue
-                        key = (entry.size, entry.digest, entry.stored)
-                        if source_archive is None and key in written_extents:
+                        key = (entry.size, entry.digest, entry.stored, entry.codec)
+                        if key in written_extents:
                             completed_work += work_size
                             _progress(progress, 5 + completed_work * 95 // max(total_work, 1),
                                       "Writing NUP container")

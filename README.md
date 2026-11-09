@@ -55,7 +55,8 @@ python -m pip install -e .
 nupstudio
 ```
 
-The app uses PySide6 and `zstandard`.
+The app uses PySide6 and `zstandard`. On Ubuntu, install the `libegl1` system
+package if `libEGL.so.1` is missing.
 
 ## Build a standalone app
 
@@ -66,12 +67,12 @@ python -m pip install -e ".[build]"
 python -m PyInstaller --clean --noconfirm --distpath build/dist --workpath build nupstudio.spec
 ```
 
-The executable or app bundle is written to `build/dist/`. The build omits unused Qt PDF, QML/Quick, Virtual Keyboard, and OpenGL components; PNG, JPEG, and WebP icon previews remain supported. GitHub Actions builds Windows, Linux, and macOS artifacts. Push a version tag such as `v0.4.0` to create a GitHub Release with downloadable packages. macOS signing and notarization are not configured.
+The executable or app bundle is written to `build/dist/`. The build omits unused Qt PDF, QML/Quick, Virtual Keyboard, and OpenGL components; PNG, JPEG, and WebP icon previews remain supported. GitHub Actions builds Windows, Linux, and macOS artifacts. Push a version tag such as `v0.5.0` to create a GitHub Release with downloadable packages. macOS signing and notarization are not configured.
 
 ## Notes
 
 - A container supports at most one base package. Update-only containers are marked standalone.
-- Zstandard compression levels can be selected when packing. Files 256 MiB or larger are stored raw because NUP v1 has no chunked Zstandard codec. Metadata edits preserve existing file extents.
+- Zstandard compression levels can be selected when packing. Files 256 MiB or larger are stored raw because NUP v1 has no chunked Zstandard codec. Metadata edits preserve file data and reuse storage for identical files.
 - Blank text fields clear their metadata. Leave the icon path blank to preserve the existing icon.
 - Wait for active background tasks to finish before closing the app.
 - The reader accepts zero alignment padding around the TOC string pool, metadata after file extents, and optional package-root names, while validating metadata bounds and overlaps.
