@@ -64,6 +64,17 @@ class LookupUITests(unittest.TestCase):
                  not self.window._pack_inspect_workers)
         self.window.close()
 
+    def test_async_inspection_prompts_for_missing_nacp(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            (root / "romfs").mkdir()
+            self.window.pack_source.edit.setText(str(root))
+            self.window._load_pack_fields()
+            wait_for(lambda: not self.window._pack_inspect_workers)
+            self.assertIn("enter title, publisher, and display version manually",
+                          self.window.statusBar().currentMessage())
+            self.assertEqual(self.window.pack_title.text(), "")
+
     def test_multiple_results_require_selection_and_review_is_opt_in(self):
         panel = self.window.pack_lookup
         panel._show_results([

@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "nupstudio"
-version = "0.5.0"
+version = "0.6.0"
 description = "Cross-platform NUP package editor"
 requires-python = ">=3.10"
 dependencies = [

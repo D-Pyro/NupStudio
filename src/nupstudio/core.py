@@ -147,6 +147,15 @@ def _make_metadata(
             raise NupError("Icon files larger than 64 MiB are not supported.")
         additions.append((3, icon_data))
 
+    dump_files = list(dump_files)
+    best_nacp = _find_nacp(dump_files)
+    if not icon_path and best_nacp:
+        folder_icon = _find_icon(dump_files, best_nacp[0])
+        if folder_icon and folder_icon.source:
+            try:
+                additions.append((3, folder_icon.source.read_bytes()))
+            except OSError:
+                pass
     found_npdm = False
     found_nacp = False
     found_build_id = False
@@ -159,7 +168,7 @@ def _make_metadata(
                 raise NupError("NPDM metadata larger than 64 MiB is not supported.")
             additions.append((1, entry.source.read_bytes()))
             found_npdm = True
-        elif key in ("romfs/control.nacp", "control.nacp") and not found_nacp:
+        elif best_nacp and entry is best_nacp[0] and not found_nacp:
             if entry.size > 64 * 1024 * 1024:
                 raise NupError("NACP metadata larger than 64 MiB is not supported.")
             additions.append((2, entry.source.read_bytes()))
@@ -203,7 +212,19 @@ def _classify_package(path: Path) -> tuple[int, int, int]:
 
 
 def _is_package(path: Path) -> bool:
-    return any((path / name).is_dir() for name in ("exefs", "romfs"))
+    parts = path.parts
+    update_root = (
+        len(parts) >= 2 and parts[-2].casefold() == "updates"
+        and parts[-1].isdecimal()
+    )
+    dlc_root = (
+        len(parts) >= 3 and parts[-3].casefold() == "dlc"
+        and re.fullmatch(r"[0-9a-fA-F]{16}", parts[-2]) is not None
+        and parts[-1].isdecimal()
+    )
+    return update_root or dlc_root or any(
+        (path / name).is_dir() for name in ("exefs", "romfs")
+    )
 
 
 def _has_packable_files(path: Path) -> bool:
@@ -280,12 +301,14 @@ def _find_packages(
 
 def _npdm_title_id(entries: list[Entry]) -> int:
     for entry in entries:
-        if entry.is_dir or entry.rel.casefold() not in ("exefs/main.npdm", "main.npdm"):
+        if entry.is_dir or not entry.source or entry.rel.casefold() != "exefs/main.npdm":
             continue
         try:
             data = entry.source.read_bytes()
-        except OSError:
+        except FileNotFoundError:
             continue
+        except OSError as exc:
+            raise NupError(f"Cannot read NPDM file {entry.source}: {exc}") from exc
         position = data.find(b"ACI0")
         while position >= 0 and position + 24 <= len(data):
             title_id = struct.unpack_from("<Q", data, position + 16)[0]
@@ -295,50 +318,119 @@ def _npdm_title_id(entries: list[Entry]) -> int:
     return 0
 
 
-def _nacp_fields(entries: list[Entry]) -> dict[str, str]:
+_NACP_MIN_SIZE = 0x3070
+_NACP_MAX_DEPTH = 6
+
+
+def _nacp_rank(rel: str) -> tuple[int, int, str] | None:
+    parts = rel.casefold().split("/")
+    if parts[-1] != "control.nacp" or len(parts) > _NACP_MAX_DEPTH:
+        return None
+    parent = parts[-2] if len(parts) > 1 else ""
+    if parent == "control":
+        preferred = 0
+    elif parent == "romfs":
+        preferred = 1
+    elif any(part == "updates" or part.startswith("program") for part in parts[:-1]):
+        preferred = 2
+    elif not parent:
+        preferred = 3
+    else:
+        preferred = 4
+    return preferred, len(parts), "/".join(parts)
+
+
+def _find_nacp(entries: Iterable[Entry]) -> tuple[Entry, dict[str, str]] | None:
+    """Return the best-ranked control.nacp that looks valid, with its decoded fields."""
+    ranked = []
     for entry in entries:
-        if entry.is_dir or entry.rel.casefold() not in ("romfs/control.nacp", "control.nacp"):
+        if entry.is_dir or not entry.source or entry.size < _NACP_MIN_SIZE:
             continue
-        if not entry.source:
-            continue
+        rank = _nacp_rank(entry.rel)
+        if rank:
+            ranked.append((rank, entry))
+    for _, entry in sorted(ranked, key=lambda item: item[0]):
         try:
             with entry.source.open("rb") as source:
-                data = source.read(0x3070)
-        except OSError:
+                data = source.read(_NACP_MIN_SIZE)
+        except FileNotFoundError:
             continue
-        return _decode_nacp(data)
-    return {}
+        except OSError as exc:
+            raise NupError(f"Cannot read NACP file {entry.source}: {exc}") from exc
+        if len(data) >= _NACP_MIN_SIZE:
+            return entry, _decode_nacp(data)
+    return None
+
+
+def _nacp_fields(entries: list[Entry]) -> dict[str, str]:
+    found = _find_nacp(entries)
+    return found[1] if found else {}
 
 
 def _metadata_entries(root: Path) -> list[Entry]:
-    candidates = (
-        "exefs/main.npdm",
-        "main.npdm",
-        "romfs/control.nacp",
-        "control.nacp",
-    )
-    entries = []
-    for relative in candidates:
-        path = root.joinpath(*relative.split("/"))
-        if not path.is_file():
-            continue
-        entries.append(Entry(
-            path.name,
-            0,
-            False,
-            relative,
-            source=path,
-            size=path.stat().st_size,
-        ))
+    entries: list[Entry] = []
+
+    def onerror(exc: OSError) -> None:
+        raise NupError(f"Cannot read package folder {exc.filename}: {exc}") from exc
+
+    for current, dirs, files in os.walk(root, topdown=True, onerror=onerror):
+        directory = Path(current)
+        relative = directory.relative_to(root)
+        depth = len(relative.parts)
+        dirs[:] = [
+            name for name in dirs
+            if name.casefold() != ".listing" and not (directory / name).is_symlink()
+        ]
+        if depth >= _NACP_MAX_DEPTH - 1:
+            dirs.clear()
+        elif directory.name.casefold() == "romfs":
+            if not any(name.casefold() == "control.nacp" for name in files) and not any(
+                name.casefold() == "control" for name in dirs
+            ):
+                dirs.clear()
+        for name in files:
+            folded = name.casefold()
+            rel = (relative / name).as_posix()
+            if not (
+                rel.casefold() == "exefs/main.npdm"
+                or folded == "control.nacp"
+                or (folded.startswith("icon_") and folded.endswith(".dat"))
+            ):
+                continue
+            path = directory / name
+            if path.is_symlink():
+                continue
+            try:
+                size = path.stat().st_size
+            except FileNotFoundError:
+                continue
+            except OSError as exc:
+                raise NupError(f"Cannot inspect file {path}: {exc}") from exc
+            entries.append(Entry(name, 0, False, rel, source=path, size=size))
     return entries
 
 
-def _scan_package(root: Path, root_dir: int) -> list[Entry]:
+def _find_icon(entries: Iterable[Entry], nacp: Entry) -> Entry | None:
+    """Return the control icon (icon_*.dat) stored beside the chosen control.nacp."""
+    folder = nacp.rel.rpartition("/")[0].casefold()
+    icons = [entry for entry in entries
+             if not entry.is_dir and entry.source and 0 < entry.size <= 64 * 1024 * 1024
+             and entry.rel.rpartition("/")[0].casefold() == folder
+             and entry.name.casefold().startswith("icon_")
+             and entry.name.casefold().endswith(".dat")]
+    if not icons:
+        return None
+    icons.sort(key=lambda item: (item.name.casefold() != "icon_americanenglish.dat",
+                                 item.name.casefold()))
+    return icons[0]
+
+
+def _scan_package(root: Path, root_dir: int, max_depth: int | None = None) -> list[Entry]:
     entries: list[Entry] = []
     dir_ids: dict[Path, int] = {root: root_dir}
     next_dir_id = root_dir + 1
 
-    def scan(directory: Path, relative: Path) -> None:
+    def scan(directory: Path, relative: Path, depth: int = 1) -> None:
         nonlocal next_dir_id
         try:
             children = sorted(directory.iterdir(), key=lambda item: item.name.encode("utf-8"))
@@ -363,7 +455,8 @@ def _scan_package(root: Path, root_dir: int) -> list[Entry]:
             if is_dir:
                 dir_ids[child] = next_dir_id
                 next_dir_id += 1
-                scan(child, rel)
+                if max_depth is None or depth < max_depth:
+                    scan(child, rel, depth + 1)
 
     scan(root, Path())
     return entries
@@ -431,13 +524,20 @@ def inspect_folder(source: str | Path) -> dict[str, str]:
     entries = entries_by_root[root]
     detected_id = dlc_id or _npdm_title_id(entries)
     nacp = {}
+    icon_file = ""
     metadata_roots = ([base_root] if base_root else []) + [
         candidate for candidate in roots if candidate != base_root
     ]
     for candidate in metadata_roots:
-        for key, value in _nacp_fields(entries_by_root[candidate]).items():
+        candidate_entries = entries_by_root[candidate]
+        found = _find_nacp(candidate_entries)
+        for key, value in (found[1] if found else {}).items():
             if value and not nacp.get(key):
                 nacp[key] = value
+        if not icon_file and found:
+            icon = _find_icon(candidate_entries, found[0])
+            if icon and icon.source:
+                icon_file = str(icon.source)
     update_versions = [
         _classify_package(candidate)[2]
         for candidate in roots
@@ -459,6 +559,7 @@ def inspect_folder(source: str | Path) -> dict[str, str]:
     result["title"] = nacp.get("title", "")
     result["publisher"] = nacp.get("publisher", "")
     result["display_version"] = nacp.get("version", "")
+    result["icon_file"] = icon_file
     return result
 
 

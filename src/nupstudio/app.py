@@ -487,6 +487,10 @@ class MainWindow(QMainWindow):
             if value and not widget.text():
                 widget.setText(value)
                 self._autofilled_pack_fields[key] = value
+        icon_file = detected.get("icon_file", "")
+        if icon_file and not self.pack_icon.edit.text().strip():
+            self.pack_icon.edit.setText(icon_file)
+            self._pack_lookup_icon = icon_file
         kinds = detected.get("package_kinds", "").split(",")
         self._pack_lookup_fields = {"title", "publisher", "display_version"}
         if any(kind in ("0", "1") for kind in kinds):
