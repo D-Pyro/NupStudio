@@ -43,7 +43,7 @@ class CoreTests(unittest.TestCase):
 
     def test_nested_packages_metadata_and_packing(self):
         with tempfile.TemporaryDirectory() as temp:
-            root = Path(temp)
+            root = Path(temp).resolve()
             base = root / "base"
             (base / "exefs").mkdir(parents=True)
             (base / "exefs" / "main.npdm").write_bytes(
@@ -103,7 +103,7 @@ class CoreTests(unittest.TestCase):
 
     def test_candidate_selection_depth_and_adjacent_icon(self):
         with tempfile.TemporaryDirectory() as temp:
-            root = Path(temp)
+            root = Path(temp).resolve()
             (root / "exefs").mkdir()
             preferred = root / "a" / "b" / "c" / "d" / "control"
             preferred.mkdir(parents=True)
