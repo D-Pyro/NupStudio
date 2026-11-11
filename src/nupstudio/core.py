@@ -11,6 +11,15 @@ from typing import Callable, Iterable
 
 import zstandard
 
+from .layout import (
+    EditionLayout,
+    LayoutError,
+    ensure_no_legacy_overwrite,
+    legacy_exclusions,
+    metadata_directories,
+    resolve_layout,
+)
+
 HEADER_SIZE = 128
 PACKAGE_SIZE = 64
 DIRECTORY_SIZE = 24
@@ -109,7 +118,14 @@ def _decode_nacp(data: bytes) -> dict[str, str]:
     result: dict[str, str] = {}
 
     def decode_field(value: bytes) -> str:
-        return value.split(b"\0", 1)[0].decode("utf-8", errors="replace").strip()
+        raw = value.split(b"\0", 1)[0]
+        try:
+            text = raw.decode("utf-8").strip()
+        except UnicodeDecodeError:
+            return ""  # encrypted/corrupt text (e.g. Switch 2 control data) is not a real string
+        if any(not char.isprintable() for char in text):
+            return ""
+        return text
 
     for offset in range(0, min(len(data), 16 * 0x300), 0x300):
         title = decode_field(data[offset : offset + 0x200])
@@ -133,6 +149,7 @@ def _make_metadata(
     icon_path: Path | None = None,
     source_name: str | None = None,
     dump_files: Iterable[Entry] = (),
+    selected_nacp: Entry | None = None,
 ) -> bytes:
     additions: list[tuple[int, bytes]] = []
     for kind, value in ((5, title), (6, publisher), (4, version)):
@@ -148,17 +165,16 @@ def _make_metadata(
         additions.append((3, icon_data))
 
     dump_files = list(dump_files)
-    best_nacp = _find_nacp(dump_files)
-    if not icon_path and best_nacp:
-        folder_icon = _find_icon(dump_files, best_nacp[0])
-        if folder_icon and folder_icon.source:
-            try:
-                additions.append((3, folder_icon.source.read_bytes()))
-            except OSError:
-                pass
     found_npdm = False
-    found_nacp = False
     found_build_id = False
+    nacp_entry = selected_nacp
+    if nacp_entry and nacp_entry.source:
+        if nacp_entry.size > 64 * 1024 * 1024:
+            raise NupError("NACP metadata larger than 64 MiB is not supported.")
+        try:
+            additions.append((2, nacp_entry.source.read_bytes()))
+        except OSError as exc:
+            raise NupError(f"Cannot read NACP file {nacp_entry.source}: {exc}") from exc
     for entry in dump_files:
         if entry.is_dir or not entry.source:
             continue
@@ -168,11 +184,6 @@ def _make_metadata(
                 raise NupError("NPDM metadata larger than 64 MiB is not supported.")
             additions.append((1, entry.source.read_bytes()))
             found_npdm = True
-        elif best_nacp and entry is best_nacp[0] and not found_nacp:
-            if entry.size > 64 * 1024 * 1024:
-                raise NupError("NACP metadata larger than 64 MiB is not supported.")
-            additions.append((2, entry.source.read_bytes()))
-            found_nacp = True
         elif key in ("exefs/main", "main") and not found_build_id and entry.size >= 0x60:
             with entry.source.open("rb") as source:
                 header = source.read(0x60)
@@ -208,7 +219,18 @@ def _classify_package(path: Path) -> tuple[int, int, int]:
             candidate = parts[index + 1]
             if re.fullmatch(r"[0-9a-fA-F]{16}", candidate) and parts[index + 2].isdecimal():
                 kind, title_id, version = 2, int(candidate, 16), int(parts[index + 2])
+        elif part == "dlc" and index + 2 == len(parts):
+            candidate = parts[index + 1]
+            if re.fullmatch(r"[0-9a-fA-F]{16}", candidate):
+                kind, title_id, version = 2, int(candidate, 16), 0
     return kind, title_id, version
+
+
+def _safe_iterdir(path: Path) -> list[Path]:
+    try:
+        return list(path.iterdir())
+    except OSError:
+        return []
 
 
 def _is_package(path: Path) -> bool:
@@ -222,7 +244,13 @@ def _is_package(path: Path) -> bool:
         and re.fullmatch(r"[0-9a-fA-F]{16}", parts[-2]) is not None
         and parts[-1].isdecimal()
     )
-    return update_root or dlc_root or any(
+    # Unversioned root-level dlc/<title_id>/ blocks are retained as DLC packages.
+    dlc_unversioned = (
+        len(parts) >= 2 and parts[-2].casefold() == "dlc"
+        and re.fullmatch(r"[0-9a-fA-F]{16}", parts[-1]) is not None
+        and not any(c.is_dir() and c.name.isdecimal() for c in _safe_iterdir(path))
+    )
+    return update_root or dlc_root or dlc_unversioned or any(
         (path / name).is_dir() for name in ("exefs", "romfs")
     )
 
@@ -256,7 +284,7 @@ def _find_packages(
             return True
         if scanned_entries is None:
             return _has_packable_files(path)
-        entries = _scan_package(path, 0)
+        entries = _scan_package(path, 0, skip_top=legacy_exclusions(path))
         if any(not entry.is_dir for entry in entries):
             scanned_entries[path] = entries
             return True
@@ -284,6 +312,7 @@ def _find_packages(
                     found.append(child)
             else:
                 pending.append((child, depth + 1))
+    found = list(dict.fromkeys(found))  # one entry per workspace folder
     found.sort(key=lambda path: (
         _classify_package(path)[0],
         _classify_package(path)[2],
@@ -340,8 +369,8 @@ def _nacp_rank(rel: str) -> tuple[int, int, str] | None:
     return preferred, len(parts), "/".join(parts)
 
 
-def _find_nacp(entries: Iterable[Entry]) -> tuple[Entry, dict[str, str]] | None:
-    """Return the best-ranked control.nacp that looks valid, with its decoded fields."""
+def _nacp_candidates(entries: Iterable[Entry]) -> Iterable[tuple[Entry, dict[str, str]]]:
+    """Yield readable, sufficiently sized control files in rank order."""
     ranked = []
     for entry in entries:
         if entry.is_dir or not entry.source or entry.size < _NACP_MIN_SIZE:
@@ -358,13 +387,11 @@ def _find_nacp(entries: Iterable[Entry]) -> tuple[Entry, dict[str, str]] | None:
         except OSError as exc:
             raise NupError(f"Cannot read NACP file {entry.source}: {exc}") from exc
         if len(data) >= _NACP_MIN_SIZE:
-            return entry, _decode_nacp(data)
-    return None
+            yield entry, _decode_nacp(data)
 
 
-def _nacp_fields(entries: list[Entry]) -> dict[str, str]:
-    found = _find_nacp(entries)
-    return found[1] if found else {}
+def _find_nacp(entries: Iterable[Entry]) -> tuple[Entry, dict[str, str]] | None:
+    return next(iter(_nacp_candidates(entries)), None)
 
 
 def _metadata_entries(root: Path) -> list[Entry]:
@@ -425,7 +452,38 @@ def _find_icon(entries: Iterable[Entry], nacp: Entry) -> Entry | None:
     return icons[0]
 
 
-def _scan_package(root: Path, root_dir: int, max_depth: int | None = None) -> list[Entry]:
+def _collect_metadata(groups: Iterable[list[Entry]]) -> tuple[dict[str, str], Entry | None, Entry | None]:
+    fields: dict[str, str] = {}
+    first_nacp = None
+    icon = None
+    seen: set[Path] = set()
+    for entries in groups:
+        for nacp, values in _nacp_candidates(entries):
+            if nacp.source in seen:
+                continue
+            if nacp.source:
+                seen.add(nacp.source)
+            if first_nacp is None:
+                first_nacp = nacp
+            for key, value in values.items():
+                if value and not fields.get(key):
+                    fields[key] = value
+            if icon is None:
+                icon = _find_icon(entries, nacp)
+    return fields, first_nacp, icon
+
+
+def _layout_metadata(layout: EditionLayout) -> tuple[dict[str, str], Entry | None, Entry | None]:
+    groups = []
+    for directory in metadata_directories(layout):
+        entries = _metadata_entries(directory)
+        groups.append([entry for entry in entries
+                       if entry.source and entry.source.parent == directory])
+    return _collect_metadata(groups)
+
+
+def _scan_package(root: Path, root_dir: int, max_depth: int | None = None,
+                  skip_top: frozenset[str] = frozenset()) -> list[Entry]:
     entries: list[Entry] = []
     dir_ids: dict[Path, int] = {root: root_dir}
     next_dir_id = root_dir + 1
@@ -438,6 +496,8 @@ def _scan_package(root: Path, root_dir: int, max_depth: int | None = None) -> li
             raise NupError(f"Cannot read package folder {directory}: {exc}") from exc
         for child in children:
             if child.name.casefold() == ".listing" or child.is_symlink():
+                continue
+            if directory == root and child.name.casefold() in skip_top:
                 continue
             is_dir = child.is_dir()
             if not is_dir and not child.is_file():
@@ -474,6 +534,7 @@ def _make_build_packages(
 ) -> list[Package]:
     scanned_entries: dict[Path, list[Entry]] = {}
     roots = _find_packages(source, scanned_entries=scanned_entries)
+    layout = resolve_layout(source)
     packages: list[Package] = []
     base_title_id = 0
     for index, root in enumerate(roots):
@@ -484,7 +545,11 @@ def _make_build_packages(
             if entry.is_dir:
                 entry.dir_id += index
         detected_id = dlc_id or _npdm_title_id(entries)
-        nacp = _nacp_fields(entries)
+        if (layout and layout.kind in ("native", "legacy_update")
+                and root == (layout.native_root.parent if layout.native_root else layout.exefs.parent)):
+            nacp, selected_nacp, selected_icon = _layout_metadata(layout)
+        else:
+            nacp, selected_nacp, selected_icon = _collect_metadata([entries])
         if title_id and kind != 2:
             detected_id = _parse_uint(title_id, base=16, limit=0xFFFFFFFFFFFFFFFF)
         override_version = base_version if kind == 0 else update_version
@@ -496,9 +561,12 @@ def _make_build_packages(
             title=title or nacp.get("title") or None,
             publisher=publisher or nacp.get("publisher") or None,
             version=display_version or nacp.get("version") or None,
-            icon_path=Path(icon_path) if icon_path else None,
+            icon_path=Path(icon_path) if icon_path else (
+                selected_icon.source if selected_icon else None
+            ),
             source_name=root.name,
             dump_files=entries,
+            selected_nacp=selected_nacp,
         )
         packages.append(Package(detected_id, version, kind, 0, entries, metadata, index))
     if not any(package.kind == 0 for package in packages):
@@ -523,21 +591,23 @@ def inspect_folder(source: str | Path) -> dict[str, str]:
     entries_by_root = {candidate: _metadata_entries(candidate) for candidate in roots}
     entries = entries_by_root[root]
     detected_id = dlc_id or _npdm_title_id(entries)
-    nacp = {}
-    icon_file = ""
+    layout = resolve_layout(source_path)
     metadata_roots = ([base_root] if base_root else []) + [
-        candidate for candidate in roots if candidate != base_root
+        candidate for candidate in roots
+        if candidate != base_root and _classify_package(candidate)[0] != 2
     ]
-    for candidate in metadata_roots:
-        candidate_entries = entries_by_root[candidate]
-        found = _find_nacp(candidate_entries)
-        for key, value in (found[1] if found else {}).items():
-            if value and not nacp.get(key):
-                nacp[key] = value
-        if not icon_file and found:
-            icon = _find_icon(candidate_entries, found[0])
-            if icon and icon.source:
-                icon_file = str(icon.source)
+    if not metadata_roots:
+        metadata_roots = roots
+    nacp, _, icon = _collect_metadata(entries_by_root[candidate] for candidate in metadata_roots)
+    if layout:
+        if layout.exefs:
+            npdm = layout.exefs / "main.npdm"
+            if npdm.is_file():
+                detected_id = _npdm_title_id(
+                    [Entry("main.npdm", 0, False, "exefs/main.npdm", source=npdm)]
+                ) or detected_id
+        if layout.kind in ("native", "legacy_update"):
+            nacp, _, icon = _layout_metadata(layout)
     update_versions = [
         _classify_package(candidate)[2]
         for candidate in roots
@@ -559,7 +629,7 @@ def inspect_folder(source: str | Path) -> dict[str, str]:
     result["title"] = nacp.get("title", "")
     result["publisher"] = nacp.get("publisher", "")
     result["display_version"] = nacp.get("version", "")
-    result["icon_file"] = icon_file
+    result["icon_file"] = str(icon.source) if icon and icon.source else ""
     return result
 
 
@@ -712,12 +782,24 @@ def _build_toc(packages: list[Package]) -> bytes:
     for index, package in enumerate(packages):
         offset = package_offset + index * PACKAGE_SIZE
         exefs = romfs = 0xFFFFFFFF
+        program1 = None
         for entry in package.entries:
             if entry.is_dir and entry.parent == package.root_dir:
                 if entry.name.casefold() == "exefs":
                     exefs = local_to_global[index][entry.dir_id]
                 elif entry.name.casefold() == "romfs":
                     romfs = local_to_global[index][entry.dir_id]
+                elif entry.name.casefold() == "program1":
+                    program1 = entry.dir_id
+        # A consolidated cross-generation package keeps its executable in program1/exefs;
+        # without recording it the loader would boot the legacy base program instead.
+        if program1 is not None and 0xFFFFFFFF in (exefs, romfs):
+            for entry in package.entries:
+                if entry.is_dir and entry.parent == program1:
+                    if entry.name.casefold() == "exefs" and exefs == 0xFFFFFFFF:
+                        exefs = local_to_global[index][entry.dir_id]
+                    elif entry.name.casefold() == "romfs" and romfs == 0xFFFFFFFF:
+                        romfs = local_to_global[index][entry.dir_id]
         struct.pack_into("<QIIIIBB", toc, offset, package.title_id, index, exefs, romfs,
                          package.version, package.kind, package.flags)
         struct.pack_into("<Q I", toc, offset + 32, package.meta_offset, len(package.metadata))
@@ -904,6 +986,10 @@ def pack_folder(
     packages = _make_build_packages(source_path, title_id, title, publisher,
                                     display_version, icon_path, base_version,
                                     update_version)
+    try:
+        ensure_no_legacy_overwrite(packages)
+    except LayoutError as exc:
+        raise NupError(str(exc)) from exc
     with tempfile.TemporaryDirectory(prefix="nupstudio-stage-") as temp_name:
         _prepare_entries(packages, compression_level, progress, Path(temp_name))
         _write_container(packages, output_path, progress=progress)
