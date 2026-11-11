@@ -18,7 +18,7 @@ def touch(root: Path, rel: str, data: bytes = b"x") -> None:
 class LayoutTests(unittest.TestCase):
     def setUp(self):
         self._tmp = tempfile.TemporaryDirectory()
-        self.root = Path(self._tmp.name)
+        self.root = Path(self._tmp.name).resolve()
         self.addCleanup(self._tmp.cleanup)
 
     def cross_gen(self):
