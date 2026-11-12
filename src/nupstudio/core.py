@@ -329,8 +329,17 @@ def _find_packages(
 
 
 def _npdm_title_id(entries: list[Entry]) -> int:
+    # A cross-generation package boots program1; its legacy exefs/ is the Switch 1 program.
+    for wanted in ("program1/exefs/main.npdm", "exefs/main.npdm"):
+        title_id = _npdm_title_id_at(entries, wanted)
+        if title_id:
+            return title_id
+    return 0
+
+
+def _npdm_title_id_at(entries: list[Entry], wanted: str) -> int:
     for entry in entries:
-        if entry.is_dir or not entry.source or entry.rel.casefold() != "exefs/main.npdm":
+        if entry.is_dir or not entry.source or entry.rel.casefold() != wanted:
             continue
         try:
             data = entry.source.read_bytes()
@@ -702,6 +711,41 @@ def _prepare_entries(packages: list[Package], compression_level: int,
     _progress(progress, 5, "Prepared package files")
 
 
+def _nested_addon_romfs(package: Package) -> int | None:
+    """Local directory id of an add-on's RomFS kept in a nested extracted layout.
+
+    Switch 2 Edition upgrade packs are dumped as <version>/base/program/0/romfs with patches in
+    <version>/updates/<patch>/program/0/romfs. Each patch holds the full patched RomFS, so the
+    newest numbered one wins over the base. Returns None when neither exists.
+    """
+    children: dict[tuple[int, str], int] = {}
+    for entry in package.entries:
+        if entry.is_dir:
+            children[(entry.parent, entry.name.casefold())] = entry.dir_id
+
+    def child(parent: int | None, name: str) -> int | None:
+        return None if parent is None else children.get((parent, name))
+
+    def program_romfs(folder: int | None) -> int | None:
+        direct = child(folder, "romfs")
+        if direct is not None:
+            return direct
+        return child(child(child(folder, "program"), "0"), "romfs")
+
+    updates = child(package.root_dir, "updates")
+    if updates is not None:
+        patches = sorted(
+            ((int(entry.name), entry.dir_id) for entry in package.entries
+             if entry.is_dir and entry.parent == updates and entry.name.isdecimal()),
+            reverse=True,
+        )
+        for _, patch in patches:
+            found = program_romfs(patch)
+            if found is not None:
+                return found
+    return program_romfs(child(package.root_dir, "base"))
+
+
 def _build_toc(packages: list[Package]) -> bytes:
     package_count = len(packages)
     dir_records: list[dict[str, int | bytes]] = [
@@ -791,15 +835,20 @@ def _build_toc(packages: list[Package]) -> bytes:
                     romfs = local_to_global[index][entry.dir_id]
                 elif entry.name.casefold() == "program1":
                     program1 = entry.dir_id
-        # A consolidated cross-generation package keeps its executable in program1/exefs;
-        # without recording it the loader would boot the legacy base program instead.
-        if program1 is not None and 0xFFFFFFFF in (exefs, romfs):
+        # A consolidated cross-generation package boots program1/exefs; without recording it the
+        # loader would boot the legacy program instead. A packed legacy exefs/ next to it is the
+        # Switch 1 program (program index 0), found by loaders from the folder structure.
+        if program1 is not None:
             for entry in package.entries:
                 if entry.is_dir and entry.parent == program1:
-                    if entry.name.casefold() == "exefs" and exefs == 0xFFFFFFFF:
+                    if entry.name.casefold() == "exefs":
                         exefs = local_to_global[index][entry.dir_id]
                     elif entry.name.casefold() == "romfs" and romfs == 0xFFFFFFFF:
                         romfs = local_to_global[index][entry.dir_id]
+        if package.kind == 2 and romfs == 0xFFFFFFFF:
+            nested = _nested_addon_romfs(package)
+            if nested is not None:
+                romfs = local_to_global[index][nested]
         struct.pack_into("<QIIIIBB", toc, offset, package.title_id, index, exefs, romfs,
                          package.version, package.kind, package.flags)
         struct.pack_into("<Q I", toc, offset + 32, package.meta_offset, len(package.metadata))

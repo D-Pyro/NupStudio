@@ -16,7 +16,9 @@ from pathlib import Path
 
 NATIVE_PROGRAM = "program1"
 NATIVE_CONTROL = "Acd_1"
-LEGACY_NAMES = ("exefs", "control")
+# The legacy exefs/ stays packed: it is the Switch 1 program an ExecuteProgram restart into
+# program index 0 boots. Only its control/ is left out; the package's metadata is the native one.
+LEGACY_NAMES = ("control",)
 
 _TITLE_ID = re.compile(r"[0-9a-fA-F]{16}")
 
@@ -148,7 +150,7 @@ def metadata_directories(layout: EditionLayout) -> tuple[Path, ...]:
 def legacy_exclusions(package_root: Path) -> frozenset[str]:
     """Top-level names to skip when packing an update folder that holds a native program1.
 
-    Legacy exefs/control siblings must not be packed alongside the native footprint.
+    The legacy control/ sibling must not be packed alongside the native footprint.
     """
     program = _child_dir(package_root, NATIVE_PROGRAM)
     if not (program and _child_dir(program, "exefs")):
